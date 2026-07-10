@@ -20,7 +20,7 @@ import uuid
 import threading
 import logging
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -54,6 +54,13 @@ TIMEFRAMES_ALL = {
     "D1":  mt5.TIMEFRAME_D1,
 }
 
+TIMEFRAME_SECONDS = {
+    "M15": 15 * 60,
+    "H1":  60 * 60,
+    "H4":  4 * 60 * 60,
+    "D1":  24 * 60 * 60,
+}
+
 # Magic number riêng cho từng khung để chạy độc lập
 MAGIC_NUMBERS = {
     "M15": 20260715,
@@ -66,6 +73,18 @@ BARS_TO_FETCH = 500          # số nến lịch sử load mỗi lần để tí
 # Tần suất quét: M15 cần check thường xuyên hơn (60s), H4/D1 chỉ cần 5 phút là đủ
 POLL_SECONDS = 60            # chu kỳ kiểm tra nến mới đóng (giây)
 MAX_WORKERS = 8              # số luồng xử lý song song (giúp quét nhiều symbol nhanh hơn)
+
+# True -> khi bot vừa khởi động, nếu nến vừa đóng có tín hiệu thì vẫn xử lý.
+# Chỉ nhận tín hiệu first-run khi nến còn mới, tránh khớp lại tín hiệu quá cũ.
+PROCESS_RECENT_SIGNAL_ON_FIRST_RUN = True
+FIRST_RUN_MAX_SIGNAL_AGE_MULTIPLIER = 1.25
+
+# ---- In tín hiệu/lệnh lịch sử khi khởi chạy để đối chiếu TradingView ----
+PRINT_HISTORY_ON_STARTUP = True
+HISTORY_LOOKBACK_BARS = 500       # số nến đã đóng gần nhất để rà lại
+HISTORY_MAX_LINES = 200           # giới hạn số dòng log mỗi symbol/timeframe
+HISTORY_SEND_TELEGRAM = False     # True nếu muốn gửi summary lịch sử lên Telegram
+DISPLAY_TIMEZONE = timezone(timedelta(hours=7), "GMT+7")
 
 def load_env_file():
     """Tự động đọc các biến cấu hình từ file .env nếu có, load vào os.environ."""
@@ -182,6 +201,27 @@ def build_test_sl_price(symbol: str, side: str, tick, symbol_info) -> float:
         reference_price = tick.ask
         sl_price = reference_price + get_min_stop_distance(symbol_info, reference_price)
     return normalize_price(symbol_info, sl_price)
+
+
+def is_recent_closed_bar(bar_time, tf_name: str) -> bool:
+    """True nếu nến đóng chưa quá cũ so với timeframe đang chạy."""
+    tf_seconds = TIMEFRAME_SECONDS.get(tf_name)
+    if not tf_seconds:
+        return False
+    max_age_seconds = tf_seconds * FIRST_RUN_MAX_SIGNAL_AGE_MULTIPLIER
+    age_seconds = (datetime.now(timezone.utc) - bar_time.to_pydatetime()).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
+
+
+def format_bar_time(bar_time) -> str:
+    """Hiển thị thời gian nến theo GMT+7."""
+    if hasattr(bar_time, "to_pydatetime"):
+        dt = bar_time.to_pydatetime()
+    else:
+        dt = bar_time
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S GMT+7")
 
 
 # ============================== PENDING SIGNALS (cho nút Vào Lệnh) ==============================
@@ -475,6 +515,135 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["longOk"] = longOk
     df["shortOk"] = shortOk
     return df
+
+
+def collect_historical_orders(df: pd.DataFrame, symbol: str, tf_name: str):
+    """Rà lại lịch sử đã fetch và mô phỏng single-trade để đối chiếu TradingView.
+    Đây là log audit, không đặt lệnh và không ghi state."""
+    closed_df = df.iloc[:-1].copy()   # bỏ nến đang chạy dở
+    if HISTORY_LOOKBACK_BARS > 0:
+        closed_df = closed_df.iloc[-HISTORY_LOOKBACK_BARS:]
+
+    events = []
+    position = None
+
+    for i, row in closed_df.iterrows():
+        price = row["close"]
+
+        if position is not None:
+            exit_reason = None
+            exit_price = price
+            if position["side"] == "long":
+                if row["low"] <= position["sl"]:
+                    exit_reason = "Hard SL"
+                    exit_price = position["sl"]
+                elif USE_EMA_STOP and row["close"] < row["emaStop"]:
+                    exit_reason = "EMA Stop"
+            else:
+                if row["high"] >= position["sl"]:
+                    exit_reason = "Hard SL"
+                    exit_price = position["sl"]
+                elif USE_EMA_STOP and row["close"] > row["emaStop"]:
+                    exit_reason = "EMA Stop"
+
+            if exit_reason:
+                risk_r = abs(exit_price - position["entry"]) / position["risk"] if position["risk"] > 0 else 0
+                pnl_r = risk_r if (
+                    (position["side"] == "long" and exit_price >= position["entry"]) or
+                    (position["side"] == "short" and exit_price <= position["entry"])
+                ) else -risk_r
+                events.append({
+                    "type": "EXIT",
+                    "side": position["side"],
+                    "time": row["time"],
+                    "price": exit_price,
+                    "reason": exit_reason,
+                    "pnl_r": pnl_r,
+                })
+                position = None
+
+        if position is not None:
+            continue
+
+        if row["longOk"]:
+            prev_lows = df["low"].iloc[max(0, i - SL_LOOKBACK_BARS):i]
+            if len(prev_lows) < SL_LOOKBACK_BARS:
+                continue
+            sl = prev_lows.min()
+            risk = price - sl
+            if risk > 0:
+                position = {"side": "long", "entry": price, "sl": sl, "risk": risk}
+                events.append({
+                    "type": "ENTRY",
+                    "side": "long",
+                    "time": row["time"],
+                    "price": price,
+                    "sl": sl,
+                    "risk": risk,
+                })
+        elif row["shortOk"]:
+            prev_highs = df["high"].iloc[max(0, i - SL_LOOKBACK_BARS):i]
+            if len(prev_highs) < SL_LOOKBACK_BARS:
+                continue
+            sl = prev_highs.max()
+            risk = sl - price
+            if risk > 0:
+                position = {"side": "short", "entry": price, "sl": sl, "risk": risk}
+                events.append({
+                    "type": "ENTRY",
+                    "side": "short",
+                    "time": row["time"],
+                    "price": price,
+                    "sl": sl,
+                    "risk": risk,
+                })
+
+    if position is not None:
+        events.append({
+            "type": "OPEN",
+            "side": position["side"],
+            "time": closed_df.iloc[-1]["time"],
+            "price": position["entry"],
+            "sl": position["sl"],
+            "risk": position["risk"],
+        })
+
+    return events
+
+
+def log_historical_orders(symbol: str, tf_name: str, df: pd.DataFrame):
+    events = collect_historical_orders(df, symbol, tf_name)
+    if not events:
+        msg = f"[HISTORY] {symbol} [{tf_name}]: không có lệnh/tín hiệu trong {HISTORY_LOOKBACK_BARS} nến đã đóng."
+        log.info(msg)
+        if HISTORY_SEND_TELEGRAM:
+            send_telegram(msg)
+        return
+
+    header = f"[HISTORY] {symbol} [{tf_name}]: {len(events)} sự kiện trong {HISTORY_LOOKBACK_BARS} nến đã đóng (giờ GMT+7)."
+    log.info(header)
+    lines = []
+    for event in events[-HISTORY_MAX_LINES:]:
+        side = event["side"].upper()
+        time_text = format_bar_time(event["time"])
+        if event["type"] == "ENTRY":
+            line = (f"[HISTORY] {symbol} [{tf_name}] {time_text} ENTRY {side} "
+                    f"entry={event['price']:.5f} sl={event['sl']:.5f} risk={event['risk']:.5f}")
+        elif event["type"] == "EXIT":
+            line = (f"[HISTORY] {symbol} [{tf_name}] {time_text} EXIT {side} "
+                    f"price={event['price']:.5f} reason={event['reason']} pnl={event['pnl_r']:.2f}R")
+        else:
+            line = (f"[HISTORY] {symbol} [{tf_name}] {time_text} OPEN {side} "
+                    f"entry={event['price']:.5f} sl={event['sl']:.5f} risk={event['risk']:.5f}")
+        log.info(line)
+        lines.append(line)
+
+    if len(events) > HISTORY_MAX_LINES:
+        log.info(f"[HISTORY] {symbol} [{tf_name}]: chỉ in {HISTORY_MAX_LINES} sự kiện mới nhất.")
+
+    if HISTORY_SEND_TELEGRAM:
+        text = header + "\n" + "\n".join(lines[-30:])
+        send_telegram(text[:3900])
 
 
 def get_active_position(symbol: str, magic: int):
@@ -872,12 +1041,20 @@ def process_symbol(symbol: str, tf_name: str, tf_value: int, state: dict):
         sym_state["last_processed_time"] = bar_time
         state[state_key] = sym_state
         if active_pos is None:
-            log.info(f"Khởi tạo trạng thái lần đầu cho {symbol} [{tf_name}] tại nến {bar_time} (Không có lệnh mở).")
-            return
+            has_entry_signal = bool(last_closed["longOk"] or last_closed["shortOk"])
+            recent_signal = has_entry_signal and is_recent_closed_bar(last_closed["time"], tf_name)
+            if PROCESS_RECENT_SIGNAL_ON_FIRST_RUN and recent_signal:
+                log.info(f"{symbol} [{tf_name}]: first-run phát hiện tín hiệu mới ở nến {bar_time}, tiếp tục xử lý.")
+            else:
+                if has_entry_signal:
+                    log.info(f"{symbol} [{tf_name}]: first-run có tín hiệu ở nến {bar_time} nhưng đã quá cũ, bỏ qua.")
+                else:
+                    log.info(f"Khởi tạo trạng thái lần đầu cho {symbol} [{tf_name}] tại nến {bar_time} (Không có lệnh mở).")
+                return
         else:
             log.info(f"Khởi tạo trạng thái lần đầu cho {symbol} [{tf_name}] tại nến {bar_time} (Phát hiện lệnh mở, đang theo dõi EMA Stop).")
 
-    if sym_state["last_processed_time"] == bar_time:
+    if not first_run and sym_state["last_processed_time"] == bar_time:
         return  # Nến này đã được xử lý rồi, bỏ qua
 
     price = last_closed["close"]
@@ -1005,6 +1182,26 @@ def warm_up_history(tasks, max_retries=5, retry_delay=30):
     return pending
 
 
+def print_startup_history(tasks):
+    """In các lệnh/tín hiệu lịch sử một lần khi bot khởi động."""
+    if not PRINT_HISTORY_ON_STARTUP:
+        return
+
+    log.info("Bắt đầu rà lịch sử tín hiệu/lệnh để đối chiếu TradingView (giờ GMT+7)...")
+    for symbol, tf_name, tf_value in tasks:
+        with mt5_lock:
+            rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, BARS_TO_FETCH)
+        if rates is None or len(rates) < EMA_SLOW_LEN + PIVOT_BARS + SL_LOOKBACK_BARS + 5:
+            got = 0 if rates is None else len(rates)
+            log.warning(f"[HISTORY] {symbol} [{tf_name}]: không đủ dữ liệu để rà lịch sử ({got} nến).")
+            continue
+
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = compute_signals(df)
+        log_historical_orders(symbol, tf_name, df)
+
+
 def main():
     if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         log.error("LỖI CẤU HÌNH: Bạn chưa nhập TELEGRAM_TOKEN hợp lệ. Vui lòng thay thế 'PASTE_YOUR_BOT_TOKEN_HERE' bằng token bot của bạn.")
@@ -1053,6 +1250,8 @@ def main():
     if still_missing:
         log.warning(f"Bot vẫn sẽ chạy, nhưng {len(still_missing)} mục trên có thể tiếp tục báo "
                      f"'không đủ dữ liệu' cho tới khi broker có đủ lịch sử.")
+
+    print_startup_history(tasks)
 
     try:
         while True:
