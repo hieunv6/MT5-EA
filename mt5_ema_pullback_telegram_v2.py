@@ -611,6 +611,91 @@ def collect_historical_orders(df: pd.DataFrame, symbol: str, tf_name: str):
     return events
 
 
+def summarize_historical_orders(events):
+    """Tổng kết lãi/lỗ từ danh sách event lịch sử theo đơn vị R và equity giả lập."""
+    closed = [e for e in events if e["type"] == "EXIT"]
+    open_positions = [e for e in events if e["type"] == "OPEN"]
+    if not closed:
+        return {
+            "closed_trades": 0,
+            "open_trades": len(open_positions),
+            "wins": 0,
+            "losses": 0,
+            "breakevens": 0,
+            "win_rate": 0.0,
+            "total_r": 0.0,
+            "avg_r": 0.0,
+            "gross_profit_r": 0.0,
+            "gross_loss_r": 0.0,
+            "profit_factor": None,
+            "max_drawdown_r": 0.0,
+            "equity_start": 100.0,
+            "equity_end": 100.0,
+            "equity_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+        }
+
+    pnl_values = [e["pnl_r"] for e in closed]
+    wins = sum(1 for pnl in pnl_values if pnl > 0)
+    losses = sum(1 for pnl in pnl_values if pnl < 0)
+    breakevens = len(pnl_values) - wins - losses
+    gross_profit_r = sum(pnl for pnl in pnl_values if pnl > 0)
+    gross_loss_r = sum(pnl for pnl in pnl_values if pnl < 0)
+    total_r = sum(pnl_values)
+    profit_factor = None if gross_loss_r == 0 else gross_profit_r / abs(gross_loss_r)
+
+    equity = 100.0
+    peak_equity = equity
+    max_drawdown_pct = 0.0
+    equity_curve_r = 0.0
+    peak_r = 0.0
+    max_drawdown_r = 0.0
+
+    for pnl_r in pnl_values:
+        equity_curve_r += pnl_r
+        peak_r = max(peak_r, equity_curve_r)
+        max_drawdown_r = min(max_drawdown_r, equity_curve_r - peak_r)
+
+        equity *= (1 + pnl_r * RISK_PCT / 100.0)
+        peak_equity = max(peak_equity, equity)
+        if peak_equity > 0:
+            drawdown_pct = (equity - peak_equity) / peak_equity * 100.0
+            max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+
+    return {
+        "closed_trades": len(closed),
+        "open_trades": len(open_positions),
+        "wins": wins,
+        "losses": losses,
+        "breakevens": breakevens,
+        "win_rate": wins / len(closed) * 100.0,
+        "total_r": total_r,
+        "avg_r": total_r / len(closed),
+        "gross_profit_r": gross_profit_r,
+        "gross_loss_r": gross_loss_r,
+        "profit_factor": profit_factor,
+        "max_drawdown_r": max_drawdown_r,
+        "equity_start": 100.0,
+        "equity_end": equity,
+        "equity_return_pct": equity - 100.0,
+        "max_drawdown_pct": max_drawdown_pct,
+    }
+
+
+def format_history_summary(symbol: str, tf_name: str, summary: dict) -> str:
+    profit_factor = "INF" if summary["profit_factor"] is None else f"{summary['profit_factor']:.2f}"
+    return (
+        f"[HISTORY SUMMARY] {symbol} [{tf_name}] "
+        f"closed={summary['closed_trades']} open={summary['open_trades']} "
+        f"win={summary['wins']} loss={summary['losses']} be={summary['breakevens']} "
+        f"winrate={summary['win_rate']:.1f}% total={summary['total_r']:.2f}R "
+        f"avg={summary['avg_r']:.2f}R PF={profit_factor} "
+        f"maxDD={summary['max_drawdown_r']:.2f}R "
+        f"equity(100,risk {RISK_PCT:.1f}%)={summary['equity_end']:.2f} "
+        f"return={summary['equity_return_pct']:.2f}% maxDD={summary['max_drawdown_pct']:.2f}%"
+    )
+
+
 def log_historical_orders(symbol: str, tf_name: str, df: pd.DataFrame):
     events = collect_historical_orders(df, symbol, tf_name)
     if not events:
@@ -622,6 +707,8 @@ def log_historical_orders(symbol: str, tf_name: str, df: pd.DataFrame):
 
     header = f"[HISTORY] {symbol} [{tf_name}]: {len(events)} sự kiện trong {HISTORY_LOOKBACK_BARS} nến đã đóng (giờ GMT+7)."
     log.info(header)
+    summary_line = format_history_summary(symbol, tf_name, summarize_historical_orders(events))
+    log.info(summary_line)
     lines = []
     for event in events[-HISTORY_MAX_LINES:]:
         side = event["side"].upper()
@@ -642,7 +729,7 @@ def log_historical_orders(symbol: str, tf_name: str, df: pd.DataFrame):
         log.info(f"[HISTORY] {symbol} [{tf_name}]: chỉ in {HISTORY_MAX_LINES} sự kiện mới nhất.")
 
     if HISTORY_SEND_TELEGRAM:
-        text = header + "\n" + "\n".join(lines[-30:])
+        text = header + "\n" + summary_line + "\n" + "\n".join(lines[-30:])
         send_telegram(text[:3900])
 
 
