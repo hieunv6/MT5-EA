@@ -70,8 +70,11 @@ MAGIC_NUMBERS = {
 }
 
 BARS_TO_FETCH = 500          # số nến lịch sử load mỗi lần để tính lại indicator/state
-# Tần suất quét: M15 cần check thường xuyên hơn (60s), H4/D1 chỉ cần 5 phút là đủ
-POLL_SECONDS = 60            # chu kỳ kiểm tra nến mới đóng (giây)
+# Quét mỗi 5 phút, CANH THEO MỐC ĐỒNG HỒ (:00, :05, :10, :15...) nên nến M15 đóng lúc nào
+# cũng rơi đúng vào 1 mốc quét, không bị trễ quá 5 phút.
+POLL_SECONDS = 300           # chu kỳ kiểm tra nến mới đóng (giây) = 5 phút
+SCAN_DELAY_BUFFER_SECONDS = 5   # trễ thêm sau mỗi mốc (vd quét lúc 10:05:05 thay vì đúng 10:05:00),
+                                 # đề phòng MT5 chưa kịp cập nhật nến ngay đúng giây đóng nến
 MAX_WORKERS = 8              # số luồng xử lý song song (giúp quét nhiều symbol nhanh hơn)
 
 # True -> khi bot vừa khởi động, nếu nến vừa đóng có tín hiệu thì vẫn xử lý.
@@ -1358,7 +1361,16 @@ def main():
             save_state(state)
             elapsed = time.time() - start
             log.info(f"Quét xong {len(tasks)} tổ hợp trong {elapsed:.1f}s.")
-            sleep_time = max(1.0, POLL_SECONDS - elapsed)
+
+            # Canh theo MỐC ĐỒNG HỒ THỰC (vd 10:00:00, 10:05:00, 10:10:00...) thay vì
+            # đếm "POLL_SECONDS giây kể từ lúc bắt đầu quét". Nhờ vậy nến M15 (đóng đúng
+            # vào phút chia hết cho 15) luôn rơi vào 1 trong các mốc quét 5 phút này,
+            # không bị trôi lệch dần theo thời gian do mỗi vòng quét mất thời gian khác nhau.
+            # Cộng thêm SCAN_DELAY_BUFFER_SECONDS (vd quét lúc 10:05:05 thay vì đúng 10:05:00)
+            # để đề phòng MT5 cần vài giây mới cập nhật xong nến vừa đóng.
+            now = time.time()
+            next_run = (int(now // POLL_SECONDS) + 1) * POLL_SECONDS + SCAN_DELAY_BUFFER_SECONDS
+            sleep_time = max(1.0, next_run - now)
             time.sleep(sleep_time)
     except KeyboardInterrupt:
         log.info("Dừng bot.")
