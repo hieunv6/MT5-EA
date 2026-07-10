@@ -1,0 +1,162 @@
+//@version=5
+strategy("EMA Pullback Strong Candle Strategy (Single Trade)", overlay=true,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=1,
+     max_labels_count=500)
+
+// Inputs
+emaFastLen = input.int(20, "EMA Fast", minval=1)
+emaSlowLen = input.int(50, "EMA Slow", minval=1)
+emaStopLen = input.int(10, "EMA trailing stop", minval=1)
+pivotBars = input.int(3, "Pivot confirm bars", minval=1)
+riskPct = input.float(2.0, "Risk per trade %", minval=0.1, step=0.1)
+pointValue = input.float(1.0, "Point value", minval=0.00000001)
+slLookbackBars = input.int(5, "SL lookback bars", options=[5, 10])
+atrLen = input.int(14, "ATR Length", minval=1)
+strongMult = input.float(1.5, "Strong candle multiplier", minval=0.1, step=0.1)
+strongLookback = input.int(2, "Strong candle lookback", minval=1, maxval=10)
+nearAtrMult = input.float(0.3, "Near EMA ATR buffer", minval=0.0, step=0.05)
+useEmaStop = input.bool(true, "Use EMA trailing stop")
+showBackground = input.bool(true, "Show trend background")
+allowLong = input.bool(true, "Cho phép vào lệnh Long")
+allowShort = input.bool(true, "Cho phép vào lệnh Short")
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaStop = ta.ema(close, emaStopLen)
+atr = ta.atr(atrLen)
+
+plot(emaFast, "EMA Fast", color=color.orange, linewidth=2)
+plot(emaSlow, "EMA Slow", color=color.blue, linewidth=1)
+plot(emaStop, "EMA Trailing Stop", color=color.new(color.purple, 0), linewidth=1)
+
+emaCrossUp = ta.crossover(emaFast, emaSlow)
+emaCrossDown = ta.crossunder(emaFast, emaSlow)
+emaTrendUp = emaFast > emaSlow
+emaTrendDown = emaFast < emaSlow
+
+bgcolor(showBackground and emaTrendUp ? color.new(color.green, 96) : na, title="Bull zone")
+bgcolor(showBackground and emaTrendDown ? color.new(color.red, 96) : na, title="Bear zone")
+
+ph = ta.pivothigh(high, pivotBars, pivotBars)
+pl = ta.pivotlow(low, pivotBars, pivotBars)
+emaAtPivot = emaFast[pivotBars]
+
+var float lastPh = na
+var int lastPhIdx = na
+var float lastPl = na
+var int lastPlIdx = na
+var bool longReached1R = false
+var bool shortReached1R = false
+var float longOneRPrice = na
+var float shortOneRPrice = na
+var float longEntryRisk = na
+var float shortEntryRisk = na
+
+if emaCrossDown
+    lastPh := na
+    lastPhIdx := na
+
+if emaCrossUp
+    lastPl := na
+    lastPlIdx := na
+
+validPh = not na(ph) and ph > emaAtPivot and emaTrendUp
+validPl = not na(pl) and pl < emaAtPivot and emaTrendDown
+
+if validPh
+    lastPh := ph
+    lastPhIdx := bar_index - pivotBars
+
+if validPl
+    lastPl := pl
+    lastPlIdx := bar_index - pivotBars
+
+plotshape(validPh, "Pivot High", shape.triangleup, location.abovebar, color.new(#7F77DD, 0), offset=-pivotBars, size=size.tiny)
+plotshape(validPl, "Pivot Low", shape.triangledown, location.belowbar, color.new(#D85A30, 0), offset=-pivotBars, size=size.tiny)
+plot(lastPh, "Last PH level", color=color.new(#7F77DD, 60), linewidth=1, style=plot.style_linebr)
+plot(lastPl, "Last PL level", color=color.new(#D85A30, 60), linewidth=1, style=plot.style_linebr)
+
+body = math.abs(close - open)
+prevBodyMax = ta.highest(math.abs(close[1] - open[1]), strongLookback)
+strongBull = close > open and body >= prevBodyMax * strongMult
+strongBear = close < open and body >= prevBodyMax * strongMult
+
+biasLong = emaTrendUp and not na(lastPh)
+biasShort = emaTrendDown and not na(lastPl)
+
+nearEmaLong = (low <= emaFast and close >= emaFast - atr * nearAtrMult) or (low <= emaSlow and close >= emaSlow - atr * nearAtrMult)
+nearEmaShort = (high >= emaFast and close <= emaFast + atr * nearAtrMult) or (high >= emaSlow and close <= emaSlow + atr * nearAtrMult)
+
+// === THAY ĐỔI: chỉ cho phép entry khi đang FLAT (không có vị thế mở) ===
+isFlat = strategy.position_size == 0
+
+longOk = biasLong and nearEmaLong and strongBull and close > emaFast and isFlat and allowLong
+shortOk = biasShort and nearEmaShort and strongBear and close < emaFast and isFlat and allowShort
+
+if longOk
+    tradeId = "Long " + str.tostring(bar_index)
+    sl = ta.lowest(low[1], slLookbackBars)
+    risk = close - sl
+    if risk > 0
+        qty = (strategy.equity * riskPct / 100) / (risk * pointValue)
+        // Đã đảm bảo isFlat nên không cần logic min() giữa các lớp pyramiding nữa
+        longEntryRisk := risk
+        longReached1R := false
+        strategy.entry(tradeId, strategy.long, qty=qty)
+        strategy.exit(tradeId + " exit", from_entry=tradeId, stop=sl)
+
+if shortOk
+    tradeId = "Short " + str.tostring(bar_index)
+    sl = ta.highest(high[1], slLookbackBars)
+    risk = sl - close
+    if risk > 0
+        qty = (strategy.equity * riskPct / 100) / (risk * pointValue)
+        shortEntryRisk := risk
+        shortReached1R := false
+        strategy.entry(tradeId, strategy.short, qty=qty)
+        strategy.exit(tradeId + " exit", from_entry=tradeId, stop=sl)
+
+if strategy.position_size > 0 and not na(longEntryRisk)
+    longOneRPrice := strategy.position_avg_price + longEntryRisk
+
+if strategy.position_size < 0 and not na(shortEntryRisk)
+    shortOneRPrice := strategy.position_avg_price - shortEntryRisk
+
+if strategy.position_size == 0 and strategy.position_size[1] > 0
+    longReached1R := false
+    longOneRPrice := na
+    longEntryRisk := na
+
+if strategy.position_size == 0 and strategy.position_size[1] < 0
+    shortReached1R := false
+    shortOneRPrice := na
+    shortEntryRisk := na
+
+if strategy.position_size > 0 and not longReached1R and not na(longOneRPrice) and high >= longOneRPrice
+    longReached1R := true
+
+if strategy.position_size < 0 and not shortReached1R and not na(shortOneRPrice) and low <= shortOneRPrice
+    shortReached1R := true
+
+// === THAY ĐỔI: EMA10 luôn active làm stop phụ, không còn phụ thuộc điều kiện đã đạt 1R ===
+// Hard SL (strategy.exit stop=sl) vẫn chạy song song — cái nào chạm trước sẽ đóng lệnh trước
+emaStopLong = useEmaStop and strategy.position_size > 0 and close < emaStop
+emaStopShort = useEmaStop and strategy.position_size < 0 and close > emaStop
+
+if emaStopLong
+    strategy.close_all(comment="Long close below EMA stop")
+
+if emaStopShort
+    strategy.close_all(comment="Short close above EMA stop")
+
+plotshape(longOk, "Long Entry", shape.labelup, location.belowbar, color.new(color.green, 0), text="LONG", textcolor=color.white, size=size.small)
+plotshape(shortOk, "Short Entry", shape.labeldown, location.abovebar, color.new(color.red, 0), text="SHORT", textcolor=color.white, size=size.small)
+plotshape(emaStopLong, "Long EMA Stop", shape.xcross, location.abovebar, color.new(color.purple, 0), text="EMA SL", textcolor=color.white, size=size.tiny)
+plotshape(emaStopShort, "Short EMA Stop", shape.xcross, location.belowbar, color.new(color.purple, 0), text="EMA SL", textcolor=color.white, size=size.tiny)
+plotshape(emaCrossUp, "EMA Cross Up", shape.xcross, location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(emaCrossDown, "EMA Cross Down", shape.xcross, location.abovebar, color.new(color.red, 0), size=size.tiny)
+
+alertcondition(longOk, title="EMA Pullback Long", message="EMA Pullback Long")
+alertcondition(shortOk, title="EMA Pullback Short", message="EMA Pullback Short")

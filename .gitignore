@@ -1,0 +1,11 @@
+# Bảo mật: không commit file chứa token/secret
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# State files sinh ra khi bot đang chạy
+signal_state.json
+pending_signals.json
