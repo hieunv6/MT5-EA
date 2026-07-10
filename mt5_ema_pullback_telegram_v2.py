@@ -36,13 +36,14 @@ import mplfinance as mpf
 # ---- Đặt lệnh tự động (EA) ----
 AUTO_TRADE = True              # True -> Tự động đặt lệnh trên MT5; False -> Chỉ gửi nút bấm vào Telegram
 
-# ---- Config cặp tiền theo từng khung thời gian ----
-# Mỗi symbol tự định nghĩa danh sách khung muốn chạy. Thêm/xóa tuỳ ý.
-# Tên symbol phải đúng với tên trên MT5/Exness (ví dụ: BTCUSDm, EURUSDm...)
-SYMBOL_TIMEFRAME_MAP = {
-    "BTCUSDm": ["M15", "H4", "D1"],
-    "EURUSDm": ["H4", "D1"],
-    "GBPUSDm": ["H4", "D1"],
+# ---- Config từng timeframe với các cặp cụ thể ----
+# Key là timeframe muốn chạy, value là danh sách symbol chạy trên timeframe đó.
+# Tên symbol phải đúng với tên trên MT5/Exness (ví dụ: BTCUSDm, EURUSDm, XAUUSDm...)
+# Thêm/xóa cặp ở từng timeframe tùy ý. Một symbol có thể xuất hiện ở nhiều timeframe.
+TIMEFRAME_SYMBOL_MAP = {
+    "M15": ["BTCUSDm"],
+    "H4":  ["BTCUSDm", "EURUSDm", "GBPUSDm"],
+    "D1":  ["BTCUSDm", "EURUSDm", "GBPUSDm"],
 }
 
 # ---- Tất cả khung thời gian hỗ trợ (không cần sửa) ----
@@ -118,15 +119,39 @@ log = logging.getLogger(__name__)
 
 def get_symbols_to_watch():
     """Trả về dict {symbol_name: [danh sách tên khung áp dụng]}
-    dựa trên SYMBOL_TIMEFRAME_MAP, chỉ giữ lại các khung có trong TIMEFRAMES_ALL."""
+    dựa trên TIMEFRAME_SYMBOL_MAP, chỉ giữ lại các khung có trong TIMEFRAMES_ALL."""
     result = {}
-    for symbol, tf_names in SYMBOL_TIMEFRAME_MAP.items():
-        valid = [tf for tf in tf_names if tf in TIMEFRAMES_ALL]
-        if valid:
-            result[symbol] = valid
-        else:
-            log.warning(f"{symbol}: không có khung hợp lệ trong TIMEFRAMES_ALL, bỏ qua.")
+    for tf_name, symbols in TIMEFRAME_SYMBOL_MAP.items():
+        if tf_name not in TIMEFRAMES_ALL:
+            log.warning(f"{tf_name}: timeframe không được hỗ trợ trong TIMEFRAMES_ALL, bỏ qua.")
+            continue
+
+        seen = set()
+        for symbol in symbols:
+            symbol = str(symbol).strip()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            result.setdefault(symbol, []).append(tf_name)
+
+    for symbol, tf_names in result.items():
+        log.info(f"{symbol}: chạy các khung {', '.join(tf_names)}")
+
+    if not result:
+        log.error("TIMEFRAME_SYMBOL_MAP không có tổ hợp symbol/timeframe hợp lệ.")
     return result
+
+
+def get_first_configured_symbol_and_timeframe(default_symbol="EURUSDm", default_tf="H4"):
+    """Lấy symbol/timeframe đầu tiên trong cấu hình để dùng cho lệnh /test."""
+    for tf_name, symbols in TIMEFRAME_SYMBOL_MAP.items():
+        if tf_name not in TIMEFRAMES_ALL:
+            continue
+        for symbol in symbols:
+            symbol = str(symbol).strip()
+            if symbol:
+                return symbol, tf_name
+    return default_symbol, default_tf
 
 
 # ============================== PENDING SIGNALS (cho nút Vào Lệnh) ==============================
@@ -694,7 +719,7 @@ def telegram_poller():
                     # Kiểm tra xem có đúng là lệnh /test từ admin không
                     if text_msg == "/test" and msg_chat_id == str(TELEGRAM_CHAT_ID):
                         log.info("Nhận được lệnh /test từ admin Telegram. Đang tạo tín hiệu test...")
-                        test_symbol = SYMBOLS_MANUAL[0] if SYMBOLS_MANUAL else "EURUSDm"
+                        test_symbol, test_tf = get_first_configured_symbol_and_timeframe()
                         
                         # Fetch tick to get real current price for test
                         with mt5_lock:
@@ -706,11 +731,11 @@ def telegram_poller():
                         price = tick.ask
                         sl_price = price - 0.00500  # Giả định SL cách 50 pips (hoặc tương đương)
                         
-                        caption = (f"🟡 [TEST-TRADE] LONG {test_symbol} (H4)\n"
+                        caption = (f"🟡 [TEST-TRADE] LONG {test_symbol} ({test_tf})\n"
                                    f"Giá giả định: {price:.5f}\nSL giả định: {sl_price:.5f}")
                         
                         if AUTO_TRADE:
-                            magic = MAGIC_NUMBERS["H4"]
+                            magic = MAGIC_NUMBERS.get(test_tf, 20260704)
                             result, err = place_market_order(test_symbol, "long", sl_price, magic)
                             if err:
                                 send_telegram(f"❌ [TEST-TRADE] Đặt lệnh test LONG {test_symbol} thất bại: {err}")
@@ -718,7 +743,7 @@ def telegram_poller():
                                 send_telegram(f"✅ [TEST-TRADE] Đặt lệnh test LONG {test_symbol} thành công!\n"
                                               f"Lot: {result.volume} | Ticket: {result.order} | SL: {sl_price:.5f}")
                         else:
-                            send_signal_with_chart(None, test_symbol, "H4", "long", price, sl_price, caption)
+                            send_signal_with_chart(None, test_symbol, test_tf, "long", price, sl_price, caption)
                         
             cleanup_expired_signals()
         except Exception as e:
@@ -983,10 +1008,10 @@ def main():
         threading.Thread(target=telegram_poller, daemon=True).start()
 
     tasks = [
-        (symbol, tf_name, TIMEFRAMES[tf_name])
+        (symbol, tf_name, TIMEFRAMES_ALL[tf_name])
         for symbol, tf_names in symbol_tf_map.items()
         for tf_name in tf_names
-        if tf_name in TIMEFRAMES
+        if tf_name in TIMEFRAMES_ALL
     ]
     log.info(f"Bắt đầu theo dõi {len(symbol_tf_map)} symbol — tổng {len(tasks)} tổ hợp symbol x khung mỗi vòng quét.")
 
