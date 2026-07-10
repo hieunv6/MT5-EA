@@ -41,15 +41,15 @@ AUTO_TRADE = True              # True -> Tự động đặt lệnh trên MT5; F
 # Tên symbol phải đúng với tên trên MT5/Exness (ví dụ: BTCUSDm, EURUSDm, XAUUSDm...)
 # Thêm/xóa cặp ở từng timeframe tùy ý. Một symbol có thể xuất hiện ở nhiều timeframe.
 TIMEFRAME_SYMBOL_MAP = {
-    "M15": ["BTCUSDm"],
-    "H4":  ["BTCUSDm", "EURUSDm", "GBPUSDm"],
-    "D1":  ["BTCUSDm", "EURUSDm", "GBPUSDm"],
+    "M15": ["BTCUSD"],
+    "H4":  ["BTCUSD"],
+    "D1":  ["BTCUSD", "EURUSD", "GBPUSD"],
 }
 
 # ---- Tất cả khung thời gian hỗ trợ (không cần sửa) ----
 TIMEFRAMES_ALL = {
     "M15": mt5.TIMEFRAME_M15,
-    "H1":  mt5.TIMEFRAME_H1,
+    # "H1":  mt5.TIMEFRAME_H1,
     "H4":  mt5.TIMEFRAME_H4,
     "D1":  mt5.TIMEFRAME_D1,
 }
@@ -57,7 +57,7 @@ TIMEFRAMES_ALL = {
 # Magic number riêng cho từng khung để chạy độc lập
 MAGIC_NUMBERS = {
     "M15": 20260715,
-    "H1":  20260701,
+    # "H1":  20260701,
     "H4":  20260704,
     "D1":  20260724,
 }
@@ -106,7 +106,7 @@ PIVOT_BARS = 3
 RISK_PCT = 5.0                   # 5% rủi ro mỗi lệnh
 SL_LOOKBACK_BARS = 5
 ATR_LEN = 14
-STRONG_MULT = 1.5
+STRONG_MULT = 1.3
 STRONG_LOOKBACK = 2
 NEAR_ATR_MULT = 0.3
 USE_EMA_STOP = True
