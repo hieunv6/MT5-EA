@@ -36,18 +36,34 @@ import mplfinance as mpf
 # ---- Đặt lệnh tự động (EA) ----
 AUTO_TRADE = True              # True -> Tự động đặt lệnh trên MT5; False -> Chỉ gửi nút bấm vào Telegram
 
-# ---- Danh sách symbol quét thủ công ----
-# Bot sẽ chỉ quét và giao dịch các symbol nằm trong danh sách này
-SYMBOLS_MANUAL = ["EURUSD", "GBPUSD", "XAUUSD"]
+# ---- Config cặp tiền theo từng khung thời gian ----
+# Mỗi symbol tự định nghĩa danh sách khung muốn chạy. Thêm/xóa tuỳ ý.
+# Tên symbol phải đúng với tên trên MT5/Exness (ví dụ: BTCUSDm, EURUSDm...)
+SYMBOL_TIMEFRAME_MAP = {
+    "BTCUSDm": ["M15", "H4", "D1"],
+    "EURUSDm": ["H4", "D1"],
+    "GBPUSDm": ["H4", "D1"],
+}
 
-# Danh sách khung thời gian muốn chạy song song. Mỗi khung tính EMA/ATR/pivot độc lập.
-TIMEFRAMES = {
-    "H4": mt5.TIMEFRAME_H4,
-    "D1": mt5.TIMEFRAME_D1,
+# ---- Tất cả khung thời gian hỗ trợ (không cần sửa) ----
+TIMEFRAMES_ALL = {
+    "M15": mt5.TIMEFRAME_M15,
+    "H1":  mt5.TIMEFRAME_H1,
+    "H4":  mt5.TIMEFRAME_H4,
+    "D1":  mt5.TIMEFRAME_D1,
+}
+
+# Magic number riêng cho từng khung để chạy độc lập
+MAGIC_NUMBERS = {
+    "M15": 20260715,
+    "H1":  20260701,
+    "H4":  20260704,
+    "D1":  20260724,
 }
 
 BARS_TO_FETCH = 500          # số nến lịch sử load mỗi lần để tính lại indicator/state
-POLL_SECONDS = 60            # chu kỳ kiểm tra nến mới đóng (giây) - check mỗi phút để kịp thời vào lệnh
+# Tần suất quét: M15 cần check thường xuyên hơn (60s), H4/D1 chỉ cần 5 phút là đủ
+POLL_SECONDS = 60            # chu kỳ kiểm tra nến mới đóng (giây)
 MAX_WORKERS = 8              # số luồng xử lý song song (giúp quét nhiều symbol nhanh hơn)
 
 def load_env_file():
@@ -78,12 +94,8 @@ ENABLE_CHART_SCREENSHOT = True   # gửi kèm ảnh chart cùng tín hiệu
 ENABLE_TRADE_BUTTON = True       # hiện nút "Vào Lệnh" dưới ảnh (chỉ hiển thị khi AUTO_TRADE = False)
 CHART_LOOKBACK_BARS = 100        # số nến hiển thị trong ảnh chart
 
-ORDER_DEVIATION = 20             # độ trượt giá cho phép (points) khi đặt lệnh
-MAGIC_NUMBERS = {                # Magic number riêng cho từng khung thời gian để chạy độc lập
-    "H4": 20260704,
-    "D1": 20260724
-}
-SIGNAL_TTL_SECONDS = 3600 * 12   # tín hiệu (nút bấm) hết hạn sau bao lâu nếu không bấm
+ORDER_DEVIATION = 20              # độ trượt giá cho phép (points) khi đặt lệnh
+SIGNAL_TTL_SECONDS = 3600 * 12    # tín hiệu (nút bấm) hết hạn sau bao lâu nếu không bấm
 
 # ---- Tham số chiến lược (giống input trong Pine Script) ----
 EMA_FAST_LEN = 20
@@ -105,9 +117,16 @@ log = logging.getLogger(__name__)
 
 
 def get_symbols_to_watch():
-    """Trả về dict {symbol_name: [danh sách các khung thời gian tương ứng]}
-    chỉ lấy từ danh sách thủ công SYMBOLS_MANUAL."""
-    return {s: list(TIMEFRAMES.keys()) for s in SYMBOLS_MANUAL}
+    """Trả về dict {symbol_name: [danh sách tên khung áp dụng]}
+    dựa trên SYMBOL_TIMEFRAME_MAP, chỉ giữ lại các khung có trong TIMEFRAMES_ALL."""
+    result = {}
+    for symbol, tf_names in SYMBOL_TIMEFRAME_MAP.items():
+        valid = [tf for tf in tf_names if tf in TIMEFRAMES_ALL]
+        if valid:
+            result[symbol] = valid
+        else:
+            log.warning(f"{symbol}: không có khung hợp lệ trong TIMEFRAMES_ALL, bỏ qua.")
+    return result
 
 
 # ============================== PENDING SIGNALS (cho nút Vào Lệnh) ==============================
