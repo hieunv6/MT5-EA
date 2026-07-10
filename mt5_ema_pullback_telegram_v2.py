@@ -154,6 +154,36 @@ def get_first_configured_symbol_and_timeframe(default_symbol="EURUSDm", default_
     return default_symbol, default_tf
 
 
+def normalize_price(symbol_info, price: float) -> float:
+    """Làm tròn giá theo số digit của symbol trên MT5."""
+    digits = getattr(symbol_info, "digits", 5)
+    return round(price, digits)
+
+
+def get_min_stop_distance(symbol_info, reference_price: float) -> float:
+    """Khoảng cách SL tối thiểu đủ rộng cho lệnh test, có buffer cho symbol biến động mạnh."""
+    point = symbol_info.point if symbol_info.point > 0 else 0.00001
+    stops_level = getattr(symbol_info, "trade_stops_level", 0) or 0
+    freeze_level = getattr(symbol_info, "trade_freeze_level", 0) or 0
+    broker_min_distance = max(stops_level, freeze_level) * point
+
+    # BTC/crypto/indices thường cần SL rộng hơn nhiều so với forex; /test chỉ cần hợp lệ để kiểm tra flow.
+    volatility_buffer = abs(reference_price) * 0.001
+    point_buffer = 100 * point
+    return max(broker_min_distance * 1.5, volatility_buffer, point_buffer)
+
+
+def build_test_sl_price(symbol: str, side: str, tick, symbol_info) -> float:
+    """Tạo SL hợp lệ cho lệnh /test theo loại symbol, tránh retcode=10016 invalid stops."""
+    if side == "long":
+        reference_price = tick.bid
+        sl_price = reference_price - get_min_stop_distance(symbol_info, reference_price)
+    else:
+        reference_price = tick.ask
+        sl_price = reference_price + get_min_stop_distance(symbol_info, reference_price)
+    return normalize_price(symbol_info, sl_price)
+
+
 # ============================== PENDING SIGNALS (cho nút Vào Lệnh) ==============================
 
 pending_signals = {}
@@ -723,13 +753,17 @@ def telegram_poller():
                         
                         # Fetch tick to get real current price for test
                         with mt5_lock:
+                            info = mt5.symbol_info(test_symbol)
                             tick = mt5.symbol_info_tick(test_symbol)
+                        if info is None:
+                            send_telegram(f"❌ Lỗi test: Không lấy được thông tin symbol {test_symbol} từ MT5.")
+                            continue
                         if tick is None:
                             send_telegram("❌ Lỗi test: Không lấy được giá tick hiện tại từ MT5.")
                             continue
                         
                         price = tick.ask
-                        sl_price = price - 0.00500  # Giả định SL cách 50 pips (hoặc tương đương)
+                        sl_price = build_test_sl_price(test_symbol, "long", tick, info)
                         
                         caption = (f"🟡 [TEST-TRADE] LONG {test_symbol} ({test_tf})\n"
                                    f"Giá giả định: {price:.5f}\nSL giả định: {sl_price:.5f}")
